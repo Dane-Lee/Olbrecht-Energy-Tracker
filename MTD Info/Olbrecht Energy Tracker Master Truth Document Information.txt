@@ -1,0 +1,492 @@
+# Olbrecht Energy System Tracker — Master Truth Document
+**Version 1 | Last Updated: 2026-04-05 | Author: Dane**
+
+---
+
+## 1. System Overview
+
+The Olbrecht Energy System Tracker is a swim training monitoring platform grounded in Jan Olbrecht's lactate-driven model (*The Science of Winning*). It tracks training stimulus vs. physiological response across three energy systems — Aerobic, Anaerobic Lactic, and Anaerobic Alactic — to detect mismatches, model fatigue state, and generate coaching recommendations.
+
+**Core loop:**
+1. Coach plans a session (intended session class + interval structure)
+2. Athlete logs subjective experience (3 scores)
+3. Rehab staff / sensors supply TritonWear data (stroke metrics, HR, HR recovery)
+4. System classifies the achieved session, computes mismatch severity, updates fatigue state across three systems, and produces recommendations
+
+**Primary users:** Coach/Rehab Staff (full access), Athlete (view + log own only)
+
+**Data sources:** Manual coach entry, athlete self-report, TritonWear (manual entry by staff only — no automated import in MVP)
+
+**Ecosystem role:** Owns the SyncEnvelope, SessionPlan, and SessionResponse contracts. Exports DerivedMetrics and ReadinessSnapshots to Swim State Pro and SentiOS.
+
+**Canonical spec documents (do not summarize these — reference by name):**
+- `Olbrecht ENERGY TRACKER - Schema and Logic Flow.pdf` — app flow, UI screens, role logic
+- `Olbrecht_Core_Formulas_HandOff.pdf` — vLamax, MLSS, VO2max pace, anaerobic capacity, taper impact formulas
+- `Olbrecht_Tracker_Technical_Handoff.pdf` — data input requirements, expected outputs, MVP feature scope
+- `Olbrecht's Lactate-Driven Swimmer Model.pdf` — theoretical framework, swimmer type profiles, periodization logic
+- `AI Conversation determining logic flow.pdf` — energy system tracking logic, zone assignment, session tagging rules
+- `Production specifications for the Olbrecht Energy Tracking System.pdf` — session classification thresholds (7 classes), mismatch formula, readiness banding, warning triggers, recommendation branching, SessionPlan/SessionResponse schemas
+- `Production logic lock Part 2.pdf` — mismatch weight tables by session class, reflow rules for missing data, psych volatility computation, normalization curves, sync payload schemas
+
+---
+
+## 2. Terminology
+
+| Term | Definition |
+|------|-----------|
+| **Session Class** | One of seven categories that describes the physiological intent of a session. See Section 4. |
+| **Intended Class** | The session class the coach planned. Derived from the SessionPlan. |
+| **Achieved Class** | The session class inferred from the actual response (pace, HR, RPE, stroke metrics). Produced as a probability distribution, not a single label. |
+| **Mismatch** | The computed divergence between intended and achieved class — expressed as a severity score 0–100 across 5 components. Never a binary flag. |
+| **Three-System Fatigue Model** | Neurological, Muscular, and Cardiovascular fatigue tracked separately. Each has its own decay rate, readiness category (Green/Yellow/Red), and coupling interactions. |
+| **vLamax** | Maximum lactate production rate — key anaerobic metric. Computed from lactate step tests. Defined in `Olbrecht_Core_Formulas_HandOff.pdf`. |
+| **MLSS** | Maximal Lactate Steady State — upper boundary of aerobic endurance zone. Defined in `Olbrecht_Core_Formulas_HandOff.pdf`. |
+| **Critical Velocity (CV)** | Athlete-specific speed anchor computed from maximal effort swims over multiple distances. Used for pace-based session classification. Not a hard-coded absolute threshold. |
+| **Event Pace Anchor** | Target race pace for each primary event distance for an athlete. Used to classify race pace sessions and compute pace adherence. |
+| **Perceived Exertion** | Athlete's subjective effort rating for a session. Scale defined in spec. **Never called "readiness."** |
+| **Focus Quality** | Athlete's subjective focus rating. **Never called "readiness."** |
+| **Overall Felt Experience** | Athlete's overall session experience rating. **Never called "readiness."** |
+| **Readiness** | Term used only for coach-computed system readiness categories (Green/Yellow/Red) derived from the fatigue model — never for athlete self-report. |
+| **Hooper Index** | Sleep, stress, fatigue, soreness self-report items (1–7 scale). Used to compute psych score and modify global readiness. |
+| **SyncEnvelope** | The wrapper object for all cross-system payloads between Olbrecht and Swim State Pro. Owned by Olbrecht. |
+| **SessionPlan** | Structured coach plan including session class, interval sets, and pace targets. Shared with Swim State Pro via SyncEnvelope. |
+| **SessionResponse** | Athlete + staff response record for a session. Linked to a SessionPlan where one exists. |
+| **DerivedMetrics** | Computed outputs (mismatch score, fatigue state, readiness, recommendations) produced by the Olbrecht engine after a session is processed. Exported to Swim State Pro. |
+| **ReadinessSnapshot** | Daily summary of system fatigue state and readiness categories, plus psych score. Exported to Swim State Pro. |
+| **TritonWear** | Swim wearable device providing stroke rate, HR zones, distance-per-stroke, SWOLF, and HR recovery. Manual data entry by coach/rehab staff only in MVP. |
+| **SWOLF** | Time per length + stroke count per length. Used as an efficiency proxy from TritonWear. |
+| **Stroke Index** | Velocity × stroke length. Used as an efficiency indicator for technical degradation mismatch component. |
+| **SentiSignal** | Event packet emitted to SentiOS after each session processing cycle. Consumed by SentiOS. Schema defined by SentiOS. |
+
+---
+
+## 3. Roles & Permissions
+
+| Role | Access |
+|------|--------|
+| **Coach / Rehab Staff** | Full edit + view. Plans sessions, enters TritonWear data, reviews mismatch dashboard, overrides flags. |
+| **Athlete** | View + edit own records only. Logs 3 subjective scores. Views simplified readiness and "Did I hit the target?" summary. Does not see coupling matrices, parameter learning logs, or cross-athlete analytics. |
+
+**Critical rule:** Athlete self-report fields (Perceived Exertion, Focus Quality, Overall Felt Experience) must never be labeled "readiness" in the UI or data model. Readiness is a system-computed output, not an athlete input.
+
+---
+
+## 4. Session Classification — Seven Classes
+
+These classes are used for both intended (planned) and achieved (inferred) session labeling. Full numeric thresholds and classification logic are in `Production specifications for the Olbrecht Energy Tracking System.pdf`.
+
+| Class | Purpose | Key Characteristics |
+|-------|---------|-------------------|
+| **Neural Sprint** | Phosphagen/neural emphasis, minimal glycolytic | 6–15s work intervals, rest:work ≥ 6:1, 50–300m total sprint volume |
+| **Muscle Power Endurance** | Max speed under limited recovery, high acidosis | 25–50m repeats, 5–15s rest, maximal first rep |
+| **Anaerobic Capacity** | Maximal glycolytic rate and tolerance | 25–50m repeats, rest ≥ work duration, high lactate target |
+| **Race Pace** | Event-specific neuromuscular patterning | Avg rep pace within 1.5% of event pace anchor, CV% < 2% |
+| **Aerobic Base** | Low–moderate intensity, high volume, stable homeostasis | ≥30 min swim time or ≥1500m, lactate ≤ 3–4 mmol/L |
+| **Threshold Aerobic Power** | Heavy–severe intensity, aerobic power development | 50–200m repeats, 5–15s rest, lactate 4–10 mmol/L |
+| **Recovery Technique** | Technical quality, regeneration, low load | Low intensity, drill content substantial, no extended heavy/severe segments |
+
+**Achieved class** is a probability distribution across all seven classes (not a single label). The classification engine uses a threshold-based deterministic backbone + a soft membership scoring layer + softmax. Calibrated with Platt scaling once labeled data exist.
+
+---
+
+## 5. Energy System Zones (for Weekly Planning)
+
+Used for weekly session tracking and target assignment. Auto-assigned from swimmer's primary event distance.
+
+| Zone | Full Name | Distance Group Priority |
+|------|-----------|------------------------|
+| A1 | Extensive Aerobic | Distance: Primary |
+| A2 | Intensive Aerobic | Distance: Secondary |
+| AN1 | Threshold / Lactate Clearance | All: Moderate |
+| AN2 | Lactate Production | Sprint: Primary |
+| SPR | Alactic Speed | Sprint: Primary |
+
+Session tagging rules (auto-assignment from repeat distance, pace, rest interval, effort level) are defined in `AI Conversation determining logic flow.pdf`. Primary/secondary system splits and weighted contribution logic are also there.
+
+---
+
+## 6. Mismatch Detection
+
+Mismatch is computed as a structured severity score (0–100), not a binary flag. Five components, weighted by intended session class:
+
+| Component | What it measures |
+|-----------|-----------------|
+| **Intent** | Cosine distance between planned session class distribution and achieved class probability distribution |
+| **Intensity Domain** | L1 distance between planned and achieved time fractions across low/moderate/heavy/severe/extreme domains |
+| **Technical Degradation** | Normalized stroke index drop or SWOLF rise from early to late main set (0–100 score) |
+| **Perceptual** | How far reported session RPE is outside predicted RPE band for achieved class |
+| **Autonomic Recovery** | HR recovery at 1/3/5 min vs. athlete baseline for that class |
+
+**Mismatch banding:** Low < 25 | Moderate 25–50 | High 50–70 | Critical > 70
+
+**Repeated mismatch warning:** High/Critical ≥ 2× in 7 days, or ≥ 3× in 14 days.
+
+Full weight tables by session class and reflow rules for missing data are in `Production logic lock Part 2.pdf`.
+
+---
+
+## 7. Three-System Fatigue Model
+
+Every processed session produces a raw load vector: `{ neurological, muscular, cardiovascular }` — coefficients sum to 1, vary by session class. Full load shape coefficients by class are in `Production specifications for the Olbrecht Energy Tracking System.pdf`.
+
+**Readiness banding (per system):**
+- Green: internal fatigue between −1 and +1
+- Yellow: between −3 and −1, or between +1 and +2
+- Red: ≤ −3 or ≥ +2
+
+**Global readiness:** Weighted aggregation of per-system readiness, modified by Hooper Index deviation and autonomic recovery mismatch.
+
+**Recommendation branches:**
+1. Mismatch low + readiness Green → maintain stimulus, progress periodization
+2. Mismatch moderate + readiness Yellow → tighten rest/pace/distance to stay in intended domain
+3. Mismatch high or readiness Red in any system → reduce dominant system load 24–48h, shift to Recovery Technique or Aerobic Base
+4. Competition within taper window → reduce volume, maintain intensity and frequency
+
+Full recommendation decision order (safety → competition → mismatch → data quality) and numeric tie-breakers are in `Production logic lock Part 2.pdf`.
+
+---
+
+## 8. Features: Built (MVP)
+
+- Role-based login: Coach/Rehab Staff and Athlete modes
+- Weekly Training Planner (coach): add/edit session per athlete or globally, energy system focus tags, AM/PM and session #1/#2 toggles, workout photo upload
+- Session Logging (athlete): date/time, stroke toggles, session volume (yardage, duration, intervals), 3 subjective scores (Perceived Exertion, Focus Quality, Overall Felt Experience), session type
+- TritonWear manual data entry (coach/rehab only): linked by session date/time
+- Mismatch detection: automatic after data entry, color-coded flags (Green/Yellow/Red), daily and weekly views, coach override / "Reviewed" marking
+- Weekly energy system comparison: target vs. actual sessions per zone, color-coded status (On Target / Within Tolerance / Missed / Overtrained)
+- Insights & Trends: weekly mismatch trend, system-specific strain graph, energy system distribution, recovery lag indicator
+
+---
+
+## 9. Features: Planned
+
+- OCR parsing of workout photos
+- Automated TritonWear import (removes manual staff entry)
+- Exports and wearable sync
+- Adaptive parameter learning (decay half-life, sensitivity weights) — activates after ≥20 sessions per class
+
+---
+
+## 10. Rules & Logic
+
+- **Subjective scores are never called "readiness"** — Perceived Exertion, Focus Quality, and Overall Felt Experience only
+- **Achieved class is always a probability distribution** — never collapse to a single label before computing mismatch
+- **All inputs autosave**
+- **Manual backfill supported anytime**
+- **All fields are date + session linked**
+- **Athlete cannot view or edit other athletes' data**
+- **TritonWear data: coach/rehab entry only** — linked by session date/time, optional fields show only relevant fields per stroke/session
+- **Mismatch flags are session-scoped** — generated automatically, coaches can override or mark reviewed
+- **Weekly energy system targets are auto-generated from primary event distance** — not the same for all athletes
+- **Tolerance rules:** A1/A2: ±1 session | AN1: ±1 session | AN2/SPR: Strict (0 unless programmed)
+- **Recommendations are training design suggestions only** — no injury diagnosis, no medical advice, no hormonal/supplement prescriptions
+- **Taper inference:** If RaceEvent is within 21 days and rolling weekly volume declines ≥35% while intensity markers are stable or increasing, set taperActive = true
+- **Learning freeze during taper** — no parameter updates while taperActive
+
+---
+
+## 11. Inter-System Contracts
+
+### Contract 1: SyncEnvelope (owner: Olbrecht Energy System Tracker)
+*Consumer: Swim State Pro*
+
+Every cross-system payload is wrapped in a SyncEnvelope. All timestamps are RFC 3339. All IDs are UUIDs.
+
+```
+SyncEnvelope {
+  syncSchemaVersion:     string (semantic version, e.g. "1.0.0")
+  sourceApp:             enum { "olbrechtSystem" | "swimStatePro" }
+  exportedAt:            RFC 3339 timestamp
+  idempotencyKey:        UUID (for safe retries / de-duplication)
+  payloadType:           enum {
+                           "athleteUpsert"
+                           "sessionPlanUpsert"
+                           "sessionResponseUpsert"
+                           "derivedMetricsUpsert"
+                           "readinessSnapshotUpsert"
+                           "raceEventUpsert"
+                         }
+  payload:               object (schema determined by payloadType)
+  payloadSchemaVersion:  string
+  externalTraceId:       string (optional)
+}
+```
+
+**Conflict rules:**
+- SessionResponse and raw sensor summaries: append-only — use `supersededByResponseId` pointers, never silent overwrite
+- SessionPlans: editable, must increment `planRevision` on each update
+- DerivedMetrics: reproducible — must store `engineVersion`, `configVersion`, `inputHash`
+
+**Idempotency:** Server-side de-duplication required on `idempotencyKey`. Repeated sends with same key must not create duplicate records.
+
+---
+
+### Contract 2: SessionPlan (owner: Olbrecht Energy System Tracker)
+*Consumer: Swim State Pro*
+
+```
+SessionPlanUpsert payload {
+  sharedAthleteId:               UUID
+  planId:                        UUID
+  planRevision:                  integer (increment on each edit)
+  startTimestamp:                RFC 3339 timestamp (athlete local time + offset)
+  timeZone:                      IANA time zone string
+  poolCourse:                    enum { "lcm" | "scm" | "yards" | "openWater" }
+  plannedTotalDistanceMeters:    integer
+  plannedDurationMinutes:        number
+  intendedSessionClass:          enum {
+                                   "neuralSprint"
+                                   "musclePowerEndurance"
+                                   "anaerobicCapacity"
+                                   "racePace"
+                                   "aerobicBase"
+                                   "thresholdAerobicPower"
+                                   "recoveryTechnique"
+                                 }
+  intendedEnergySystemFocus:     enum {
+                                   "aerobicCapacity" | "aerobicPower"
+                                   "anaerobicCapacity" | "anaerobicPower"
+                                   "mixed" | "none"
+                                 }
+  intervalSets: [
+    {
+      setIndex:                  integer
+      setLabel:                  string
+      primaryStroke:             enum (free | back | breast | fly | IM | kick | drill)
+      equipmentTags:             string[]
+      repeatDistanceMeters:      number
+      repeats:                   integer
+      targetPaceSecondsPer100:   number | null
+      targetEventPaceAnchor:     event ID (optional)
+      restSeconds:               number
+      restType:                  enum { "passive" | "easySwim" | "drill" }
+      intensityDomainTarget:     enum { "low" | "moderate" | "heavy" | "severe" | "extreme" | "mixed" }
+      notes:                     string (optional)
+    }
+  ]
+  strokeDistribution:            object (percent per stroke + kick + drill)
+  coachFocusTag:                 string or string[]
+  notes:                         string (optional)
+  plannedLactateTargetMmol:      number | null (optional)
+  competitionPrepFlag:           boolean (optional)
+  linkedRaceEventId:             UUID | null (optional)
+  createdAt:                     RFC 3339 timestamp
+  updatedAt:                     RFC 3339 timestamp
+}
+```
+
+**Validation (enforced at plan creation):**
+- `plannedTotalDistanceMeters` must match computed sum from sets within tolerance (±3% or ±100m), or plan is marked `partialPlan`
+- If `intendedSessionClass` = `musclePowerEndurance`: at least one set must meet anaerobic power criteria (short rest + low total distance), else warn
+- If `intendedSessionClass` = `anaerobicCapacity`: rest-to-work ratio at set level must be ≥1:1, else warn
+
+---
+
+### Contract 3: SessionResponse (shared with Swim State Pro)
+
+```
+SessionResponseUpsert payload {
+  sharedAthleteId:               UUID
+  responseId:                    UUID
+  responseRevision:              integer
+  linkedPlanId:                  UUID | null (null = response-only session, always permitted)
+  startTimestamp:                RFC 3339 timestamp
+  timeZone:                      IANA string
+  poolCourse:                    enum
+  actualTotalDistanceMeters:     integer
+  actualDurationMinutes:         number
+  sessionRPE:                    number
+  sessionRPEscaleType:           enum { "borg620" | "categoryRatio10" }
+  readinessInputs: {
+    readinessScore:              integer 0–10  (NOTE: field name is historical; this is athlete's
+                                               pre-session state — do NOT display as "readiness" in UI)
+    focusScore:                  integer 0–10
+    intensityPerception:         integer 0–10
+    fatigueIndicators:           string[] (tagged items)
+  }
+  hooperInputs: {                (optional)
+    sleepQuality:                integer 1–7
+    stress:                      integer 1–7
+    fatigue:                     integer 1–7
+    muscleSoreness:              integer 1–7
+  }
+  heartRateSummary: {            (optional)
+    heartRateAverage:            number
+    heartRatePeak:               number
+    samplingRateHz:              number (optional)
+    measurementContext:          enum { "duringSwimOptical" | "duringSwimChest" | "derivedFromRecovery" | "unknown" }
+  }
+  postMainSetHeartRateRecovery: { (optional)
+    hrAtEndMainSet:              number
+    hrAfter1Min:                 number
+    hrAfter3Min:                 number
+    hrAfter5Min:                 number
+  }
+  strokeMetrics: {               (optional — from TritonWear)
+    distancePerStroke:           number (optional)
+    strokeLengthPerCycle:        number (optional)
+    strokeIndex:                 number (optional)  — velocity × stroke length
+    swolf:                       number (optional)  — time/length + stroke count/length
+  }
+  intervalTimes:                 number[] (optional — rep times in seconds)
+  dataSource:                    enum { "manual" | "swimStatePro" | "garmin" | "polar" | "whoop" | "other" }
+  supersededByResponseId:        UUID | null (for append-only versioning)
+  createdAt:                     RFC 3339 timestamp
+  updatedAt:                     RFC 3339 timestamp
+}
+```
+
+---
+
+### Contract 4: DerivedMetrics (exported to Swim State Pro)
+
+Produced by the Olbrecht engine after a session is processed. Swim State Pro consumes this to update its recovery model.
+
+```
+DerivedMetricsUpsert payload {
+  sharedAthleteId:               UUID
+  derivedId:                     UUID
+  linkedResponseId:              UUID
+  engineVersion:                 string
+  configVersion:                 string
+  inputHash:                     string (reproducibility fingerprint)
+
+  achievedClassDistribution: {
+    neuralSprint:                number (probability 0–1)
+    musclePowerEndurance:        number
+    anaerobicCapacity:           number
+    racePace:                    number
+    aerobicBase:                 number
+    thresholdAerobicPower:       number
+    recoveryTechnique:           number
+    // sum = 1.0
+  }
+
+  achievedIntensityDomainDistribution: {
+    low:                         number (fraction of session time)
+    moderate:                    number
+    heavy:                       number
+    severe:                      number
+    extreme:                     number
+    // sum = 1.0
+  }
+
+  mismatch: {
+    mismatchSeverity0to100:      number
+    mismatchComponents0to1: {
+      intent:                    number
+      intensityDomain:           number
+      technicalDegradation:      number
+      perceptual:                number
+      autonomicRecovery:         number
+    }
+    mismatchWeights: {           (weights used — sum to 1.0)
+      intent:                    number
+      intensityDomain:           number
+      technicalDegradation:      number
+      perceptual:                number
+      autonomicRecovery:         number
+    }
+  }
+
+  systemLoadRaw: {
+    neurological:                number (load units)
+    muscular:                    number
+    cardiovascular:              number
+  }
+
+  fatigueStateAfterDecay:        object (per-system bounded fatigue values)
+  fatigueStateAfterCoupling:     object
+  fatigueStateAfterAccumulation: object
+  recoveryDebt:                  number
+
+  readiness: {
+    systemReadinessCategory: {
+      neurological:              enum { "green" | "yellow" | "red" }
+      muscular:                  enum { "green" | "yellow" | "red" }
+      cardiovascular:            enum { "green" | "yellow" | "red" }
+    }
+    globalReadinessCategory:     enum { "green" | "yellow" | "red" }
+    warnings:                    string[] (warning codes)
+  }
+
+  recommendation: {
+    recommendationCode:          string
+    recommendationDetail:        object
+  }
+
+  createdAt:                     RFC 3339 timestamp
+}
+```
+
+---
+
+### Contract 5: ReadinessSnapshot (exported daily to Swim State Pro)
+
+```
+ReadinessSnapshotUpsert payload {
+  sharedAthleteId:               UUID
+  snapshotDate:                  date (YYYY-MM-DD)
+  timeZone:                      IANA string
+
+  systemFatigue: {
+    neurological:                number (bounded internal fatigue value)
+    muscular:                    number
+    cardiovascular:              number
+  }
+
+  systemReadinessCategory: {
+    neurological:                enum { "green" | "yellow" | "red" }
+    muscular:                    enum { "green" | "yellow" | "red" }
+    cardiovascular:              enum { "green" | "yellow" | "red" }
+  }
+
+  globalReadinessCategory:       enum { "green" | "yellow" | "red" }
+  psychScore0to100:              number (optional)
+  psychVolatilityPercent:        number (optional)
+  sleepScore:                    number (optional)
+
+  createdAt:                     RFC 3339 timestamp
+}
+```
+
+**Psych score** is derived from Hooper Index items normalized to athlete baseline (28-day rolling median). Computation in `Production logic lock Part 2.pdf`.
+
+**Shared athlete identity:** Both apps use a `sharedAthleteId` (UUID). Identity linking via `SharedAthleteLink` entity — auto-link on matching `externalStableKey` (federation ID or hashed email); medium-confidence candidate on name + DOB match (requires manual approval); never auto-merge on key conflict.
+
+---
+
+## 12. SentiSignal Emission
+
+After each session is processed, Olbrecht emits a SentiSignal packet to SentiOS. The SentiSignal schema is defined and owned by SentiOS — Olbrecht is a producer only. See SentiOS MTD for the packet structure.
+
+Fields Olbrecht is expected to populate in each SentiSignal:
+- `sourceApp`: `"olbrechtSystem"`
+- `athleteId`: shared UUID
+- `eventType`: `"sessionProcessed"`
+- `timestamp`: RFC 3339
+- `severity`: derived from mismatch severity and readiness categories
+- `payload`: summary of mismatch band, readiness categories, active warnings
+
+---
+
+## 13. Open Items
+
+- [ ] **TritonWear section specifics** — the Schema and Logic Flow doc notes "section specifics will be given separately." The exact TritonWear data entry fields per stroke/session type have not been fully defined.
+- [ ] **Athlete profile / swimmer classification** — primary event distance assignment, course type (SCY/SCM/LCM) logging, race distance group auto-assignment not yet confirmed as built vs. planned.
+- [ ] **Critical velocity computation** — the spec requires CV to be computed from maximal effort swims. Where does this testing data live in the data model? Is there a `TestResult` entity?
+- [ ] **Athlete zone definitions** — the spec requires stored versioned zone definitions per athlete. Is this built or planned?
+- [ ] **Codex build status** — which features are code-complete vs. still in development? This MTD reflects the full spec intent; actual build state in Codex may be a subset.
+- [ ] **SentiSignal exact schema** — the SentiOS MTD needs to lock the full SentiSignal packet structure so Olbrecht knows exactly what fields to populate.
+
+---
+
+## 14. People & Context
+
+**Owner:** Dane
+
+**Built in:** Codex (implementation sessions). Architecture/design coordination in Claude Code.
+
+**Status:** In development. Production spec is locked (see spec documents above). Build is in progress in Codex.
+
+**Ecosystem role:** Anchor system for the Olbrecht↔Swim State Pro contracts. Changes to SyncEnvelope, SessionPlan, or SessionResponse schemas will cascade contract flags to Swim State Pro in Command Station.
