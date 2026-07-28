@@ -9,6 +9,7 @@
     "typecheck": "tsc -p tsconfig.app.json --noEmit",
     "test:engine": "node scripts/run-engine-tests.mjs",
     "lint": "eslint .",
+    "verify": "npm run typecheck && npm run lint && npm run test:engine && npm run build && npm run typecheck --prefix server",
     "preview": "vite preview"
   },
   "dependencies": {

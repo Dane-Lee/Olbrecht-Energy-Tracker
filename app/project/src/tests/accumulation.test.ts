@@ -31,7 +31,7 @@ test('accumulation applies weighted nonlinear load accumulation and clamps to bo
   assertApproximatelyEqual(result.weightedSystemLoad.neurological, 0.3);
   assertApproximatelyEqual(result.weightedSystemLoad.muscular, 1);
   assertApproximatelyEqual(result.weightedSystemLoad.cardiovascular, -1.8);
-  assertApproximatelyEqual(result.finalFatigueState.neurological, 3.7255941819529867);
+  assertApproximatelyEqual(result.finalFatigueState.neurological, 3.725594181952987);
   assertApproximatelyEqual(result.finalFatigueState.muscular, 0.8847968677143805);
   assertApproximatelyEqual(result.finalFatigueState.cardiovascular, -5.986338138776092);
 });

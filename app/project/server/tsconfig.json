@@ -17,7 +17,8 @@
     "moduleDetection": "force",
     "baseUrl": ".",
     "paths": {
-      "@domain": ["../src/domain/index.ts"]
+      "@domain": ["../src/domain/index.ts"],
+      "@/*": ["../src/*"]
     }
   },
   "include": ["src"]
