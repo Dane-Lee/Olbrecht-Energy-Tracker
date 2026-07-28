@@ -5,6 +5,7 @@ import './accumulation.test';
 import './classificationMetrics.test';
 import './readinessModulation.test';
 import './hubSyncAdapter.test';
+import './connectionSettings.test';
 
 import { runRegisteredTests } from './testHarness';
 

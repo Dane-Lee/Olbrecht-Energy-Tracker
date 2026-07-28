@@ -6,9 +6,26 @@
  * Storage is pluggable: in-memory for tests/engine use, localStorage in the
  * browser. Envelopes keep their idempotencyKey across retries so the hub
  * deduplicates instead of double-ingesting.
+ *
+ * Connection switchboard (milestone eco-connection-settings): 'off' stops an
+ * envelope from ever being queued; 'pause' keeps queuing but the drain loop
+ * skips paused rows entirely (they stay 'pending', untouched) until flipped
+ * back. Defaults to fully open so apps that never touch the switchboard are
+ * behaviorally identical to today (ecosystem rule 1).
  */
 import type { AnySyncEnvelope, UUID } from '@/domain';
+import {
+  DEFAULT_CONNECTION_SETTINGS,
+  outboundState,
+  shouldEnqueue,
+  shouldTransmit,
+} from '@/ecosystem-contracts/connections';
+import type { ConnectionSettingsReader } from './connection-settings.adapter';
 import type { HubSyncAdapter } from './hub-sync.adapter';
+
+const OPEN_CONNECTION_SETTINGS: ConnectionSettingsReader = {
+  load: () => DEFAULT_CONNECTION_SETTINGS,
+};
 
 export interface OutboxEntry {
   envelope: AnySyncEnvelope;
@@ -67,20 +84,35 @@ export interface SyncOutboxOptions {
   maxAttempts?: number;
   /** Called after each drain — the SentiOS reporting hook. */
   onDrain?: (report: DrainReport) => void;
+  /**
+   * Connection switchboard reader; defaults to fully open (every payload type
+   * 'on') so outboxes that never receive one behave exactly as before this
+   * feature existed (ecosystem rule 1).
+   */
+  connectionSettings?: ConnectionSettingsReader;
 }
 
 export class SyncOutbox {
   private readonly storage: OutboxStorage;
   private readonly maxAttempts: number;
   private readonly onDrain?: (report: DrainReport) => void;
+  private readonly connectionSettings: ConnectionSettingsReader;
 
   constructor(options: SyncOutboxOptions = {}) {
     this.storage = options.storage ?? new MemoryOutboxStorage();
     this.maxAttempts = options.maxAttempts ?? 10;
     this.onDrain = options.onDrain;
+    this.connectionSettings = options.connectionSettings ?? OPEN_CONNECTION_SETTINGS;
   }
 
+  /**
+   * Queues an envelope. Connection switchboard: 'off' for this payload type
+   * skips queuing entirely; 'pause' still queues (only transmission stops).
+   */
   enqueue(envelope: AnySyncEnvelope): void {
+    const state = outboundState(this.connectionSettings.load(), envelope.payloadType);
+    if (!shouldEnqueue(state)) return;
+
     const entries = this.storage.load();
     if (entries.some((entry) => entry.envelope.idempotencyKey === envelope.idempotencyKey)) {
       return; // Already queued — idempotent enqueue.
@@ -145,13 +177,21 @@ export class SyncOutbox {
   }
 
   /**
-   * Pushes all pending entries through the adapter in one batch. Failures
-   * stay queued (bounded by maxAttempts); results are reported via onDrain.
+   * Pushes all pending, transmittable entries through the adapter in one
+   * batch. Failures stay queued (bounded by maxAttempts); results are
+   * reported via onDrain. Connection switchboard: entries whose payload type
+   * is currently 'pause' or 'off' are left untouched in storage — still
+   * 'pending', attempts unchanged — so flipping back to 'on' resumes exactly
+   * where drain left off ('off' rows were never queued in the first place).
    */
   async drain(adapter: Pick<HubSyncAdapter, 'pushBatch'>): Promise<DrainReport> {
     const entries = this.storage.load();
+    const settings = this.connectionSettings.load();
     const pendingEntries = entries.filter(
-      (entry) => entry.status === 'pending' && entry.attempts < this.maxAttempts,
+      (entry) =>
+        entry.status === 'pending' &&
+        entry.attempts < this.maxAttempts &&
+        shouldTransmit(outboundState(settings, entry.envelope.payloadType)),
     );
 
     const report: DrainReport = { accepted: 0, conflicts: 0, rejected: 0, transportFailed: false };

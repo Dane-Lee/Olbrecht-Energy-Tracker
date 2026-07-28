@@ -1,6 +1,7 @@
 import { HubSyncAdapter } from '@/adapters/hub-sync.adapter';
 import { MemoryOutboxStorage, SyncOutbox } from '@/adapters/sync-outbox';
 import { createEnvelope } from '@/adapters/envelope-factory';
+import { ConnectionSettingsManager, MemoryConnectionSettingsStorage } from '@/adapters/connection-settings.adapter';
 import { InternalSystem, ReadinessCategory, SourceApp, SyncPayloadType } from '@/domain';
 import type { ReadinessSnapshotUpsertPayload } from '@/domain';
 import { assertEqual, assertOk, test } from './testHarness';
@@ -223,4 +224,124 @@ test('outbox drain records hub rejections and fails entries after max attempts',
   assertEqual(second.rejected, 1);
   assertEqual(outbox.pending().length, 0); // maxAttempts reached → failed
   assertEqual(outbox.entryFor(envelope.idempotencyKey)?.status, 'failed');
+});
+
+// --- Connection switchboard gating (milestone eco-connection-settings) ---
+
+test('outbox enqueue skips queuing entirely when the payload type is off', () => {
+  const connectionSettings = new ConnectionSettingsManager({ storage: new MemoryConnectionSettingsStorage() });
+  connectionSettings.setConnectionState('outbound', SyncPayloadType.ReadinessSnapshotUpsert, 'off');
+
+  const outbox = new SyncOutbox({ storage: new MemoryOutboxStorage(), connectionSettings });
+  outbox.enqueue(createEnvelope(SyncPayloadType.ReadinessSnapshotUpsert, readinessPayload()));
+
+  assertEqual(outbox.pending().length, 0);
+});
+
+test('outbox enqueue still queues when the payload type is paused (only transmit stops)', () => {
+  const connectionSettings = new ConnectionSettingsManager({ storage: new MemoryConnectionSettingsStorage() });
+  connectionSettings.setConnectionState('outbound', SyncPayloadType.ReadinessSnapshotUpsert, 'pause');
+
+  const outbox = new SyncOutbox({ storage: new MemoryOutboxStorage(), connectionSettings });
+  outbox.enqueue(createEnvelope(SyncPayloadType.ReadinessSnapshotUpsert, readinessPayload()));
+
+  assertEqual(outbox.pending().length, 1);
+});
+
+test('outbox drain leaves paused entries queued untouched and never calls the adapter for them', async () => {
+  const connectionSettings = new ConnectionSettingsManager({ storage: new MemoryConnectionSettingsStorage() });
+  connectionSettings.setConnectionState('outbound', SyncPayloadType.ReadinessSnapshotUpsert, 'pause');
+
+  const outbox = new SyncOutbox({ storage: new MemoryOutboxStorage(), connectionSettings });
+  const envelope = createEnvelope(SyncPayloadType.ReadinessSnapshotUpsert, readinessPayload());
+  outbox.enqueue(envelope);
+
+  let pushBatchCalls = 0;
+  const adapter = {
+    async pushBatch() {
+      pushBatchCalls += 1;
+      return [];
+    },
+  };
+
+  const report = await outbox.drain(adapter);
+
+  assertEqual(pushBatchCalls, 0);
+  assertEqual(report.accepted, 0);
+  assertEqual(outbox.pending().length, 1);
+  assertEqual(outbox.entryFor(envelope.idempotencyKey)?.attempts, 0);
+});
+
+test('outbox drain transmits normally when connection settings are left default-open', async () => {
+  const outbox = new SyncOutbox({ storage: new MemoryOutboxStorage() });
+  const envelope = createEnvelope(SyncPayloadType.ReadinessSnapshotUpsert, readinessPayload());
+  outbox.enqueue(envelope);
+
+  const { impl } = fakeFetch((_url, init) => {
+    const body = JSON.parse(String(init?.body)) as { envelopes: { idempotencyKey: string }[] };
+    return {
+      body: {
+        results: body.envelopes.map((e) => ({ idempotencyKey: e.idempotencyKey, accepted: true, conflictDetected: false })),
+      },
+    };
+  });
+  const adapter = new HubSyncAdapter({ hubUrl: 'http://hub.test', serviceKey: 'sk', fetchImpl: impl });
+
+  const report = await outbox.drain(adapter);
+  assertEqual(report.accepted, 1);
+  assertEqual(outbox.pending().length, 0);
+});
+
+test('pullPage skips the network call and preserves the cursor when the requested type is off', async () => {
+  const connectionSettings = new ConnectionSettingsManager({ storage: new MemoryConnectionSettingsStorage() });
+  connectionSettings.setConnectionState('inbound', SyncPayloadType.ReadinessSnapshotUpsert, 'off');
+
+  const { impl, calls } = fakeFetch(() => ({ body: { envelopes: [], nextCursor: 'should-not-be-used', hasMore: false } }));
+  const adapter = new HubSyncAdapter({ hubUrl: 'http://hub.test', serviceKey: 'sk', fetchImpl: impl, connectionSettings });
+
+  const page = await adapter.pullPage({ since: 'cursor-123', payloadTypes: [SyncPayloadType.ReadinessSnapshotUpsert] });
+
+  assertEqual(calls.length, 0);
+  assertEqual(page.envelopes.length, 0);
+  assertEqual(page.hasMore, false);
+  assertEqual(page.nextCursor, 'cursor-123');
+});
+
+test('pullPage skips the network call when the requested type is paused', async () => {
+  const connectionSettings = new ConnectionSettingsManager({ storage: new MemoryConnectionSettingsStorage() });
+  connectionSettings.setConnectionState('inbound', SyncPayloadType.ReadinessSnapshotUpsert, 'pause');
+
+  const { impl, calls } = fakeFetch(() => ({ body: { envelopes: [], nextCursor: 'x', hasMore: false } }));
+  const adapter = new HubSyncAdapter({ hubUrl: 'http://hub.test', serviceKey: 'sk', fetchImpl: impl, connectionSettings });
+
+  const page = await adapter.pullPage({ payloadTypes: [SyncPayloadType.ReadinessSnapshotUpsert] });
+
+  assertEqual(calls.length, 0);
+  assertEqual(page.envelopes.length, 0);
+});
+
+test('pullPage still calls the hub when the requested type is on (default-open)', async () => {
+  const { impl, calls } = fakeFetch(() => ({ body: { envelopes: [], nextCursor: 'y', hasMore: false } }));
+  const adapter = new HubSyncAdapter({ hubUrl: 'http://hub.test', serviceKey: 'sk', fetchImpl: impl });
+
+  await adapter.pullPage({ payloadTypes: [SyncPayloadType.ReadinessSnapshotUpsert] });
+
+  assertEqual(calls.length, 1);
+  assertOk(calls[0].url.includes('types=readinessSnapshotUpsert'), 'requested type passed through when on');
+});
+
+test('reportConnectionSettings PUTs the switchboard to the hub with the service key', async () => {
+  const { impl, calls } = fakeFetch((url) => {
+    assertOk(url.endsWith('/api/ecosystem/connections'), `unexpected URL ${url}`);
+    return { body: {} };
+  });
+  const adapter = new HubSyncAdapter({ hubUrl: 'http://hub.test', serviceKey: 'sk', fetchImpl: impl });
+
+  const connectionSettings = new ConnectionSettingsManager({ storage: new MemoryConnectionSettingsStorage() });
+  await adapter.reportConnectionSettings(connectionSettings.load());
+
+  assertEqual(calls.length, 1);
+  assertEqual(calls[0].init?.method, 'PUT');
+  const headers = calls[0].init?.headers as Record<string, string>;
+  assertEqual(headers['x-service-key'], 'sk');
 });
