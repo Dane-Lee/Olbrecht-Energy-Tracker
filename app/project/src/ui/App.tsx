@@ -21,7 +21,15 @@ import {
   ReadinessCategory,
   SessionClass,
 } from '@/domain';
-import { createSessionPlannerRecommendation } from '@/features';
+import {
+  createSessionPlannerRecommendation,
+  useEcosystemControlCenter,
+} from '@/features';
+import {
+  ControlCenter,
+  ControlCenterLauncher,
+  useControlCenterHotkey,
+} from '@/ecosystem-control-center';
 
 const SESSION_CLASS_LABELS: Readonly<Record<SessionClass, string>> = {
   [SessionClass.NeuralSprint]: 'Neural sprint',
@@ -118,6 +126,9 @@ function formatPercent(scale: number): string {
 
 export default function App() {
   const [draft, setDraft] = useState<PlannerDraft>(loadDraft);
+  const [controlCenterOpen, setControlCenterOpen] = useState(false);
+  const ecosystem = useEcosystemControlCenter();
+  useControlCenterHotkey(() => setControlCenterOpen((open) => !open));
   const recommendation = useMemo(
     () =>
       createSessionPlannerRecommendation({
@@ -170,7 +181,21 @@ export default function App() {
           <span className="status-dot local" />
           Local planning mode
         </div>
+        <ControlCenterLauncher
+          status={ecosystem.status}
+          onClick={() => setControlCenterOpen(true)}
+        />
       </header>
+      <ControlCenter
+        hostApp="olbrechtSystem"
+        status={ecosystem.status}
+        loading={ecosystem.loading}
+        error={ecosystem.error}
+        open={controlCenterOpen}
+        onClose={() => setControlCenterOpen(false)}
+        onRefresh={ecosystem.refresh}
+        onConnectionChange={ecosystem.setConnection}
+      />
 
       <section className="hero-grid">
         <div>

@@ -11,4 +11,6 @@ export const config = {
     .split(',')
     .map((origin) => origin.trim())
     .filter(Boolean),
+  athleteOsHubUrl: process.env.ATHLETEOS_HUB_URL?.replace(/\/$/, ''),
+  athleteOsServiceKey: process.env.ATHLETEOS_SERVICE_KEY,
 } as const;
