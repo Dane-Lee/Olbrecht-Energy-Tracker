@@ -1,6 +1,6 @@
 # Olbrecht Energy Tracker — Program CLAUDE.md
 *Ecosystem role: Tier 2 — Sport-Specific (Energy Systems / Lactate)*
-*Master Mind: `C:\Users\dlee5\OneDrive\Desktop\MasterMind\CLAUDE.md`*
+*Master Mind: `C:\Users\dlee5\OneDrive\Desktop\Personal Coding Projects\Athlete Ecosystem\MasterMind\CLAUDE.md`*
 
 ---
 

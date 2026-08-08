@@ -1,0 +1,32 @@
+# Windows / OneDrive
+desktop.ini
+Thumbs.db
+.DS_Store
+
+# Credentials — never commit
+.env
+.env.*
+!.env.example
+*password*.docx
+*Password*.docx
+*credential*
+*secret*
+
+# Word lock files
+~$*
+
+# Dependencies and build output
+node_modules
+dist
+dist-ssr
+build
+*.tsbuildinfo
+
+# Logs
+*.log
+logs
+
+# Local data
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
